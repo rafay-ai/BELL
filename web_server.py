@@ -121,14 +121,32 @@ from datetime import date  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 
 
-def build_web_system() -> str:
+def goals_block() -> str:
+    import sqlite3
+    try:
+        con = sqlite3.connect(str(HERE / "companion.db"))
+        rows = con.execute("SELECT id, text, deadline FROM goals WHERE done=0").fetchall()
+        con.close()
+    except Exception:
+        rows = []
+    if not rows:
+        return ("The user has not told you any goals yet. NEVER claim they promised, committed to, "
+                "or said anything they did not say in this conversation. If you want to push them, "
+                "ask what they are working on, and when they state a goal, call set_goal.\n\n")
+    lines = "\n".join(f"- {t}" + (f" (due {d})" if d else "") for _, t, d in rows)
+    return ("Goals the user has told you about (hold them to these and only these):\n" + lines +
+            "\nNEVER claim they promised or said anything that is not in this list or this conversation. "
+            "When they state a new goal, call set_goal.\n\n")
+
+
+def _build_web_system_raw() -> str:
     """Same personality as the CLI, but the emotion tag comes FIRST so the voice knows it early."""
     s = brain.SYSTEM
     s = re.sub(r"(?m)^(\w+): (.*?) \[emotion: (\w+)\]\s*$", r"\1: [emotion: \3] \2", s)
     s = re.sub(r"Today's date is \d{4}-\d{2}-\d{2}",
                f"Today's date is {date.today().isoformat()}", s)
     cut = s.index("End EVERY reply")
-    return s[:cut] + (
+    return s[:cut] + goals_block() + (
         "Format: begin EVERY reply with a first line exactly like [emotion: X], "
         f"where X is one of: {', '.join(brain.EMOTIONS)}. Then write what you say. "
         "Put the tag only at the start, never at the end."
@@ -235,7 +253,7 @@ async def turn_events(text: str):
                 stream = await brain.client.chat.completions.create(
                     model=brain.MODEL,
                     messages=[{"role": "system", "content": build_web_system()}] + msgs,
-                    tools=state["tools"],
+                    tools=[t for t in state["tools"] if t["function"]["name"] != "set_goal"],
                     temperature=0.3,
                     stream=True,
                     extra_body={"reasoning_effort": "none"},
@@ -274,18 +292,21 @@ async def turn_events(text: str):
                     msgs.append(entry)
                     for k, c in sorted(calls.items()):
                         yield {"t": "tool", "v": c["name"]}
+                        print(f"[tool] {c['name']} {c['args']}", flush=True)
                         try:
                             result = await state["session"].call_tool(
                                 c["name"], json.loads(c["args"] or "{}"))
                             out = "".join(x.text for x in result.content if hasattr(x, "text"))
                         except Exception as e:
                             out = f"Tool error: {e}"
+                        print(f"[tool result] {out}", flush=True)
                         msgs.append({"role": "tool", "tool_call_id": ids[k], "content": out})
                     continue
 
                 msgs.append(entry)
                 completed = True
                 trim(msgs)
+                spawn(extract_goals(text))
                 yield {"t": "done"}
                 return
             yield {"t": "error", "v": "I got stuck on that one."}
@@ -312,3 +333,73 @@ async def chat_stream(body: ChatIn):
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------- goals: saved by code, not by the persona ----------------
+from datetime import timedelta  # noqa: E402
+import habit_server as hs  # noqa: E402
+
+bg: set = set()
+
+
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    bg.add(t)
+    t.add_done_callback(bg.discard)
+
+
+def week_table() -> str:
+    d0 = date.today()
+    return "; ".join(f"{(d0 + timedelta(days=i)).strftime('%A')} {(d0 + timedelta(days=i)).isoformat()}"
+                     for i in range(8))
+
+
+GOAL_TOOL = {"type": "function", "function": {
+    "name": "set_goal",
+    "description": "Save a goal or commitment the user clearly states they want to achieve. deadline is optional, YYYY-MM-DD.",
+    "parameters": {"type": "object",
+                   "properties": {"text": {"type": "string"}, "deadline": {"type": "string"}},
+                   "required": ["text"]}}}
+
+
+async def extract_goals(text: str):
+    try:
+        system = (f"Today and the coming days: {week_table()} (the first entry is today). "
+                  "If the user's message states a goal, commitment or task they want to achieve, call set_goal "
+                  "with a short text and a deadline as YYYY-MM-DD taken from the dates above when one is stated or implied. "
+                  "If the message is not a goal, do not call any tool.")
+        r = await brain.client.chat.completions.create(
+            model=brain.MODEL, temperature=0.2, tools=[GOAL_TOOL],
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
+            extra_body={"reasoning_effort": "none"},
+        )
+        for tc in (r.choices[0].message.tool_calls or []):
+            if tc.function.name != "set_goal":
+                continue
+            args = json.loads(tc.function.arguments or "{}")
+            goal = (args.get("text") or "").strip()
+            if not goal:
+                continue
+            deadline = (args.get("deadline") or "").strip()
+
+            def save():
+                with hs.gdb() as con:
+                    if con.execute("SELECT 1 FROM goals WHERE done=0 AND lower(text)=?",
+                                   (goal.lower(),)).fetchone():
+                        return "duplicate"
+                    con.execute("INSERT INTO goals(text, deadline) VALUES (?,?)", (goal, deadline or None))
+                return "saved"
+
+            print(f"[goal] {await asyncio.to_thread(save)}: {goal} {deadline}", flush=True)
+    except Exception as e:
+        print(f"[goal error] {e}", flush=True)
+
+
+def build_web_system() -> str:
+    s = _build_web_system_raw()
+    today = date.today()
+    s = s.replace(f"Today's date is {today.isoformat()}",
+                  f"Today's date is {today.strftime('%A')} {today.isoformat()}")
+    s = s.replace("call set_goal", "acknowledge it")
+    return s + ("\n\nGoals are saved automatically by a separate system. You have no tool for saving goals. "
+                "Never say you are saving, logging, tracking or setting one; at most say you noted it.")

@@ -10,6 +10,7 @@ REF_TEXT = open(os.path.join(os.path.dirname(__file__), "voice_ref.txt")).read()
 
 # Delivery only. Never describe the speaker, because the reference fixes the identity.
 EMOTIONS = {
+    "stern":     "Speak in a serious, stern, firm tone, controlled and low, not shouting.",
     "neutral":   "Speak in a calm, natural tone.",
     "happy":     "Speak in a cheerful, bright tone, slightly faster.",
     "proud":     "Speak in a warm, proud, encouraging tone.",

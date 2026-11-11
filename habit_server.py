@@ -106,5 +106,31 @@ def record_habit(name: str) -> str:
         return f"Logged '{match}' for today."
     return f"'{match}' was already logged today."
 
+def gdb():
+    con = db()
+    con.execute("CREATE TABLE IF NOT EXISTS goals (id INTEGER PRIMARY KEY, text TEXT, deadline TEXT, done INTEGER DEFAULT 0)")
+    return con
+
+@mcp.tool()
+def set_goal(text: str, deadline: str = "") -> str:
+    """Save a goal or commitment the user clearly states they want to achieve, for example finishing a report or sleeping before 11pm. deadline is optional, format YYYY-MM-DD."""
+    with gdb() as con:
+        con.execute("INSERT INTO goals(text, deadline) VALUES (?,?)", (text.strip(), deadline or None))
+    return f"Goal saved: {text.strip()}"
+
+@mcp.tool()
+def list_goals() -> str:
+    """List the user's open goals with their ids."""
+    with gdb() as con:
+        rows = con.execute("SELECT id, text, deadline FROM goals WHERE done=0").fetchall()
+    return "\n".join(f"[{i}] {t}" + (f" (due {d})" if d else "") for i, t, d in rows) or "No open goals."
+
+@mcp.tool()
+def complete_goal(goal_id: int) -> str:
+    """Mark a goal as achieved by its id."""
+    with gdb() as con:
+        con.execute("UPDATE goals SET done=1 WHERE id=?", (goal_id,))
+    return f"Goal {goal_id} marked done."
+
 if __name__ == "__main__":
     mcp.run()
