@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+replies/
+companion.db
+*.bak*
+backup_v1/
+assets/
+.env
+*.out
+*.wav

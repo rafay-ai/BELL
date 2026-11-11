@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bell</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f4f1; --text:#1d1b19; --muted:#7a746d; --me:#2f5d50; --bell:#ebe6df; --err:#b3392f; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#15130f; --text:#eee9e2; --muted:#968f86; --me:#3d7a69; --bell:#2a2621; --err:#e0766d; } }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-bottom: 1px solid var(--bell); }
+  .title { font-weight: 600; font-size: 18px; }
+  #status { flex: 1; color: var(--muted); font-size: 14px; }
+  header label, header button { font-size: 14px; color: var(--muted); }
+  header button { background: none; border: 1px solid var(--bell); border-radius: 8px; padding: 4px 10px; cursor: pointer; color: inherit; }
+  main { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: min(80%, 560px); padding: 9px 13px; border-radius: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .me { align-self: flex-end; background: var(--me); color: #fff; border-bottom-right-radius: 4px; }
+  .bell { align-self: flex-start; background: var(--bell); border-bottom-left-radius: 4px; }
+  .error { align-self: center; color: var(--err); font-size: 14px; }
+  .emo { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); }
+  form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--bell); }
+  input[type=text] { flex: 1; padding: 11px 14px; font-size: 16px; border-radius: 12px; border: 1px solid var(--bell); background: var(--bg); color: var(--text); }
+  form button { padding: 0 18px; font-size: 16px; border: 0; border-radius: 12px; background: var(--me); color: #fff; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Bell</span>
+  <span id="status"></span>
+  <label><input type="checkbox" id="mute"> mute</label>
+  <button id="reset" type="button">new chat</button>
+</header>
+<main id="log"></main>
+<form id="form">
+  <input type="text" id="input" autocomplete="off" placeholder="Say something..." autofocus>
+  <button type="submit">Send</button>
+</form>
+<script>
+  var log = document.getElementById('log');
+  var form = document.getElementById('form');
+  var input = document.getElementById('input');
+  var statusEl = document.getElementById('status');
+  var muteBox = document.getElementById('mute');
+  var AC = window.AudioContext || window.webkitAudioContext;
+  var ctx = null;
+  var playHead = 0;
+  var RATE = 24000;
+  var NL = String.fromCharCode(10);
+  var speechChain = Promise.resolve();
+  var pendingSpeech = 0;
+  var busyTurn = false;
+  var active = [];   // bubbles whose text is still being revealed
+
+  function setStatus(t) { statusEl.textContent = t || ''; }
+
+  setInterval(function () {
+    if (ctx && ctx.currentTime < playHead) setStatus('speaking...');
+    else if (pendingSpeech > 0) setStatus('getting her voice ready...');
+    else if (busyTurn) setStatus('thinking...');
+    else setStatus('');
+  }, 150);
+
+  // Reveal each sentence in step with its audio.
+  function shownText(seg) {
+    if (seg.instant) return seg.text;
+    if (!ctx || seg.startAt === null) return '';
+    var now = ctx.currentTime;
+    if (now < seg.startAt) return '';
+    if (seg.endAt !== null && now >= seg.endAt) return seg.text;
+    var dur = seg.endAt !== null ? (seg.endAt - seg.startAt) : Math.max(0.5, seg.text.length / 15);
+    var frac = (now - seg.startAt) / dur;
+    if (seg.endAt === null) frac = Math.min(frac, 0.95);
+    var n = Math.max(1, Math.ceil(frac * seg.words.length));
+    return seg.words.slice(0, n).join(' ');
+  }
+
+  setInterval(function () {
+    for (var i = 0; i < active.length; i++) {
+      var rec = active[i];
+      var parts = [];
+      for (var j = 0; j < rec.segs.length; j++) {
+        var t = shownText(rec.segs[j]);
+        if (t) parts.push(t);
+      }
+      var joined = parts.join(' ');
+      if (rec.bubble.text.textContent !== joined) {
+        rec.bubble.text.textContent = joined;
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    if (active.length > 6) active.shift();
+  }, 60);
+
+  function unlockAudio() {
+    if (!ctx) ctx = new AC();
+    if (ctx.state === 'suspended') ctx.resume();
+  }
+
+  function add(kind, text) {
+    var d = document.createElement('div');
+    d.className = 'msg ' + kind;
+    d.textContent = text;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function newBellBubble() {
+    var d = document.createElement('div');
+    d.className = 'msg bell';
+    var t = document.createElement('span');
+    var e = document.createElement('span');
+    e.className = 'emo';
+    d.appendChild(t);
+    d.appendChild(e);
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+    return { text: t, label: e };
+  }
+
+  async function post(url, body) {
+    var r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) {
+      var detail = '';
+      try { detail = (await r.json()).detail; } catch (e) {}
+      throw new Error(detail || r.statusText);
+    }
+    return r;
+  }
+
+  async function streamSpeech(seg, emotion, onFirst) {
+    var r = await post('/api/speak', { text: seg.text, emotion: emotion });
+    var reader = r.body.getReader();
+    var pending = new Uint8Array(0);
+
+    function play(bytes) {
+      var n = bytes.length >> 1;
+      if (!n) return;
+      var view = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
+      var buf = ctx.createBuffer(1, n, RATE);
+      var ch = buf.getChannelData(0);
+      for (var i = 0; i < n; i++) ch[i] = view.getInt16(i * 2, true) / 32768;
+      var src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      var startAt = playHead > ctx.currentTime ? playHead : ctx.currentTime + 0.12;
+      src.start(startAt);
+      playHead = startAt + buf.duration;
+      if (seg.startAt === null) {
+        seg.startAt = startAt;
+        if (onFirst) onFirst();
+      }
+    }
+
+    while (true) {
+      var res = await reader.read();
+      if (res.done) break;
+      var merged = new Uint8Array(pending.length + res.value.length);
+      merged.set(pending);
+      merged.set(res.value, pending.length);
+      pending = merged;
+      if (pending.length >= 9600) {
+        var usable = pending.length - (pending.length % 2);
+        play(pending.slice(0, usable));
+        pending = pending.slice(usable);
+      }
+    }
+    play(pending);
+    if (seg.startAt === null) seg.instant = true;   // no audio came back, so just show the text
+    else seg.endAt = playHead;
+  }
+
+  // The chain waits only until a sentence's audio has finished ARRIVING (Breeze handles one
+  // request at a time); earlier sentences keep playing in the background.
+  function queueSpeech(seg, emotion, onFirst) {
+    pendingSpeech++;
+    speechChain = speechChain.then(async function () {
+      try { await streamSpeech(seg, emotion, onFirst); }
+      catch (err) { seg.instant = true; add('error', 'Voice: ' + err.message); }
+      pendingSpeech--;
+    });
+  }
+
+  form.addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var text = input.value.trim();
+    if (!text) return;
+    unlockAudio();
+    input.value = '';
+    add('me', text);
+
+    var t0 = performance.now();
+    var rec = null, emotion = 'neutral', tGen = null, tVoice = null;
+    var secs = function (t) { return ((t - t0) / 1000).toFixed(1) + 's'; };
+    var refreshLabel = function () {
+      if (!rec) return;
+      var parts = [emotion];
+      if (tGen !== null) parts.push('written in ' + secs(tGen));
+      if (tVoice !== null) parts.push('voice in ' + secs(tVoice));
+      rec.bubble.label.textContent = parts.join(' - ');
+    };
+    var onFirstAudio = function () {
+      if (tVoice === null) { tVoice = performance.now(); refreshLabel(); }
+    };
+    var handle = function (e) {
+      if (e.t === 'emotion') { emotion = e.v; refreshLabel(); }
+      else if (e.t === 'sentence') {
+        if (!rec) {
+          rec = { bubble: newBellBubble(), segs: [] };
+          active.push(rec);
+        }
+        var seg = { text: e.v, words: e.v.split(/\s+/).filter(Boolean),
+                    startAt: null, endAt: null, instant: muteBox.checked };
+        rec.segs.push(seg);
+        if (!muteBox.checked) queueSpeech(seg, emotion, onFirstAudio);
+        refreshLabel();
+      }
+      else if (e.t === 'done') { tGen = performance.now(); refreshLabel(); }
+      else if (e.t === 'error') add('error', e.v);
+      // 'delta' events are ignored on purpose: text is revealed sentence by sentence with the voice
+    };
+
+    busyTurn = true;
+    try {
+      var r = await fetch('/api/chat_stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text })
+      });
+      if (!r.ok) {
+        var detail = '';
+        try { detail = (await r.json()).detail; } catch (x) {}
+        throw new Error(detail || r.statusText);
+      }
+      var reader = r.body.getReader();
+      var dec = new TextDecoder();
+      var buf = '';
+      while (true) {
+        var res = await reader.read();
+        if (res.done) break;
+        buf += dec.decode(res.value, { stream: true });
+        var lines = buf.split(NL);
+        buf = lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].trim()) handle(JSON.parse(lines[i]));
+        }
+      }
+      if (buf.trim()) handle(JSON.parse(buf));
+    } catch (err) {
+      add('error', err.message);
+    }
+    busyTurn = false;
+  });
+
+  document.getElementById('reset').addEventListener('click', async function () {
+    try { await post('/api/reset', {}); log.innerHTML = ''; active = []; }
+    catch (err) { add('error', err.message); }
+  });
+</script>
+</body>
+</html>
