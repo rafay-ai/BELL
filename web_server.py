@@ -247,13 +247,16 @@ async def turn_events(text: str):
         msgs.append({"role": "user", "content": text})
         completed = False
         try:
+            just_did = await run_actions(text)
+            for note in just_did:
+                yield {"t": "action", "v": note}
             for _ in range(6):
                 parser = ReplyParser()
                 calls: dict = {}
                 stream = await brain.client.chat.completions.create(
                     model=brain.MODEL,
-                    messages=[{"role": "system", "content": build_web_system()}] + msgs,
-                    tools=[t for t in state["tools"] if t["function"]["name"] != "set_goal"],
+                    messages=[{"role": "system", "content": build_web_system(just_did)}] + msgs,
+                    tools=[t for t in state["tools"] if t["function"]["name"] in READ_TOOLS],
                     temperature=0.3,
                     stream=True,
                     extra_body={"reasoning_effort": "none"},
@@ -306,7 +309,6 @@ async def turn_events(text: str):
                 msgs.append(entry)
                 completed = True
                 trim(msgs)
-                spawn(extract_goals(text))
                 yield {"t": "done"}
                 return
             yield {"t": "error", "v": "I got stuck on that one."}
@@ -403,3 +405,168 @@ def build_web_system() -> str:
     s = s.replace("call set_goal", "acknowledge it")
     return s + ("\n\nGoals are saved automatically by a separate system. You have no tool for saving goals. "
                 "Never say you are saving, logging, tracking or setting one; at most say you noted it.")
+
+
+# ---------------- actions: all changes are made by code, not by the persona ----------------
+READ_TOOLS = {"get_streak"}
+
+
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    bg.add(t)
+    t.add_done_callback(bg.discard)
+    return t
+
+
+def _tool(name, desc, props, required):
+    return {"type": "function", "function": {
+        "name": name, "description": desc,
+        "parameters": {"type": "object", "properties": props, "required": required}}}
+
+
+_STR = {"type": "string"}
+_INT = {"type": "integer"}
+ACTION_TOOLS = [
+    _tool("set_goal", "Save a goal or commitment the user states. deadline is YYYY-MM-DD.",
+          {"text": _STR, "deadline": _STR}, ["text"]),
+    _tool("complete_goal", "Mark a listed goal as achieved, by id.", {"goal_id": _INT}, ["goal_id"]),
+    _tool("delete_goal", "Remove a listed goal. ONLY when the user explicitly asks to delete, remove or cancel it.",
+          {"goal_id": _INT}, ["goal_id"]),
+    _tool("record_habit", "Log that the user did a routine today (exercise, water, reading, sleep).",
+          {"name": _STR}, ["name"]),
+    _tool("add_task", "Add a small to-do the user asks you to remember. due is YYYY-MM-DD.",
+          {"title": _STR, "due": _STR}, ["title"]),
+    _tool("complete_task", "Mark a listed task as done, by id.", {"task_id": _INT}, ["task_id"]),
+    _tool("note_feedback", "Save how the user wants you to behave or treat them, as a short instruction.",
+          {"text": _STR}, ["text"]),
+]
+
+
+def snapshot():
+    with hs.gdb() as con:
+        con.execute("CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, text TEXT, active INTEGER DEFAULT 1)")
+        goals = con.execute("SELECT id, text, deadline FROM goals WHERE done=0").fetchall()
+        tasks = con.execute("SELECT id, title, due FROM tasks WHERE done=0").fetchall()
+        habits = [r[0] for r in con.execute("SELECT name FROM habits")]
+        done_today = {r[0] for r in con.execute(
+            "SELECT h.name FROM habits h JOIN logs l ON l.habit_id=h.id WHERE l.day=?",
+            (date.today().isoformat(),))}
+        fb = [r[0] for r in con.execute("SELECT text FROM feedback WHERE active=1 ORDER BY id DESC LIMIT 15")]
+    return goals, tasks, habits, done_today, fb
+
+
+def apply_action(name: str, a: dict):
+    """Run one change. Returns a short note for the page, or None if nothing happened."""
+    if name == "record_habit":
+        return hs.record_habit(str(a.get("name", "")))
+    if name == "add_task":
+        title = str(a.get("title", "")).strip()
+        return hs.add_task(title, str(a.get("due", "") or "")) if title else None
+    with hs.gdb() as con:
+        con.execute("CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, text TEXT, active INTEGER DEFAULT 1)")
+        if name == "set_goal":
+            goal = str(a.get("text", "")).strip()
+            if not goal:
+                return None
+            if con.execute("SELECT 1 FROM goals WHERE done=0 AND lower(text)=?", (goal.lower(),)).fetchone():
+                return None
+            deadline = str(a.get("deadline", "") or "").strip()
+            con.execute("INSERT INTO goals(text, deadline) VALUES (?,?)", (goal, deadline or None))
+            return f"Goal saved: {goal}" + (f" (due {deadline})" if deadline else "")
+        if name in ("complete_goal", "delete_goal"):
+            row = con.execute("SELECT text FROM goals WHERE id=? AND done=0", (int(a.get("goal_id")),)).fetchone()
+            if not row:
+                return None
+            done = 1 if name == "complete_goal" else 2     # 2 = removed (restorable)
+            con.execute("UPDATE goals SET done=? WHERE id=?", (done, int(a.get("goal_id"))))
+            return ("Goal done: " if done == 1 else "Goal removed: ") + row[0]
+        if name == "complete_task":
+            row = con.execute("SELECT title FROM tasks WHERE id=? AND done=0", (int(a.get("task_id")),)).fetchone()
+            if not row:
+                return None
+            con.execute("UPDATE tasks SET done=1 WHERE id=?", (int(a.get("task_id")),))
+            return "Task done: " + row[0]
+        if name == "note_feedback":
+            fb = str(a.get("text", "")).strip()
+            if not fb:
+                return None
+            con.execute("INSERT INTO feedback(text) VALUES (?)", (fb,))
+            return "Noted: " + fb
+    return None
+
+
+async def run_actions(text: str) -> list:
+    notes = []
+    try:
+        goals, tasks, habits, _, _ = await asyncio.to_thread(snapshot)
+        fmt = lambda rows: "\n".join(f"[{i}] {t}" + (f" (due {d})" if d else "") for i, t, d in rows) or "none"
+        system = (
+            f"Today and the coming days: {week_table()} (the first entry is today).\n"
+            f"Open goals:\n{fmt(goals)}\nOpen tasks:\n{fmt(tasks)}\n"
+            f"Tracked habits: {', '.join(habits) or 'none'}\n\n"
+            "Decide whether the user's latest message asks for any change. Call one tool per change; "
+            "call nothing if none applies.\n"
+            "- set_goal: they state a goal or commitment (deadline as YYYY-MM-DD from the dates above).\n"
+            "- complete_goal / complete_task: they say they finished a listed goal or task (use its id).\n"
+            "- delete_goal: ONLY when they explicitly ask to remove, delete or cancel a listed goal.\n"
+            "- record_habit: they say they did a routine today. Short name; reuse an existing habit name if it fits.\n"
+            "- add_task: they ask you to remember a small to-do.\n"
+            "- note_feedback: they tell you how to behave or treat them (tone, strictness, what to stop doing).\n"
+            "Never invent changes, and never delete anything they did not explicitly ask to delete.")
+        r = await brain.client.chat.completions.create(
+            model=brain.MODEL, temperature=0.2, tools=ACTION_TOOLS,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
+            extra_body={"reasoning_effort": "none"})
+        for tc in (r.choices[0].message.tool_calls or []):
+            try:
+                note = await asyncio.to_thread(
+                    apply_action, tc.function.name, json.loads(tc.function.arguments or "{}"))
+            except Exception as e:
+                print(f"[action error] {tc.function.name}: {e}", flush=True)
+                continue
+            if note:
+                print(f"[action] {note}", flush=True)
+                notes.append(note)
+    except Exception as e:
+        print(f"[actions error] {e}", flush=True)
+    return notes
+
+
+def build_web_system() -> str:
+    s = _build_web_system_raw()
+    today = date.today()
+    s = s.replace(f"Today's date is {today.isoformat()}",
+                  f"Today's date is {today.strftime('%A')} {today.isoformat()}")
+    s = s.replace("call set_goal", "acknowledge it")
+    s = re.sub(r"Tool rules:[^\n]*\n*", "", s)
+    goals, tasks, habits, done_today, fb = snapshot()
+    extra = ("\n\nYou cannot change goals, tasks, habits or settings yourself: a separate system does it "
+             "automatically and the screen shows a small note when it happens. Never say you saved, logged, "
+             "removed, finished or changed something as if you did it yourself. You may use the read-only tools to look things up.")
+    if habits:
+        extra += "\nHabits today: " + ", ".join(f"{h} ({'done' if h in done_today else 'not yet'})" for h in habits)
+    if tasks:
+        extra += "\nOpen tasks: " + "; ".join(t for _, t, _ in tasks)
+    if fb:
+        extra += ("\nHow they have told you to treat them (follow it, but it never overrides the lines you never cross):\n"
+                  + "\n".join(f"- {x}" for x in fb))
+    return s + extra
+
+
+@app.get("/api/state")
+async def api_state():
+    goals, tasks, habits, done_today, fb = await asyncio.to_thread(snapshot)
+    return {"goals": goals, "tasks": tasks, "habits": habits,
+            "done_today": sorted(done_today), "feedback": fb}
+
+
+_prev_build = build_web_system
+
+
+def build_web_system(just_did=None) -> str:
+    s = _prev_build()
+    if just_did:
+        s += ("\n\nBecause of their latest message, the system just did this, and it is ALREADY DONE: "
+              + "; ".join(just_did)
+              + ". React to it in character, but never argue as if it had not happened.")
+    return s

@@ -20,6 +20,7 @@
   .me { align-self: flex-end; background: var(--me); color: #fff; border-bottom-right-radius: 4px; }
   .bell { align-self: flex-start; background: var(--bell); border-bottom-left-radius: 4px; }
   .error { align-self: center; color: var(--err); font-size: 14px; }
+  .note { align-self: center; color: var(--muted); font-size: 13px; padding: 2px 10px; }
   .emo { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); }
   form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--bell); }
   input[type=text] { flex: 1; padding: 11px 14px; font-size: 16px; border-radius: 12px; border: 1px solid var(--bell); background: var(--bg); color: var(--text); }
@@ -218,6 +219,7 @@
         refreshLabel();
       }
       else if (e.t === 'done') { tGen = performance.now(); refreshLabel(); }
+      else if (e.t === 'action') add('note', e.v);
       else if (e.t === 'error') add('error', e.v);
       // 'delta' events are ignored on purpose: text is revealed sentence by sentence with the voice
     };
