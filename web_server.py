@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
                               "parameters": t.inputSchema}}
                 for t in listed.tools
             ]
-            state["messages"] = []
+            state["messages"] = load_turns()
             state["lock"] = asyncio.Lock()
             print(f"Tools: {[t['function']['name'] for t in state['tools']]}")
             yield
@@ -111,6 +111,7 @@ async def speak(body: SpeakIn):
 async def reset():
     async with state["lock"]:
         state["messages"].clear()
+        await asyncio.to_thread(clear_turns)
     return {"ok": True}
 
 
@@ -247,7 +248,7 @@ async def turn_events(text: str):
         msgs.append({"role": "user", "content": text})
         completed = False
         try:
-            just_did = await run_actions(text)
+            just_did, recalled = await asyncio.gather(run_actions(text), recall(text))
             for note in just_did:
                 yield {"t": "action", "v": note}
             for _ in range(6):
@@ -255,7 +256,7 @@ async def turn_events(text: str):
                 calls: dict = {}
                 stream = await brain.client.chat.completions.create(
                     model=brain.MODEL,
-                    messages=[{"role": "system", "content": build_web_system(just_did)}] + msgs,
+                    messages=[{"role": "system", "content": build_web_system(just_did, recalled)}] + msgs,
                     tools=[t for t in state["tools"] if t["function"]["name"] in READ_TOOLS],
                     temperature=0.3,
                     stream=True,
@@ -309,6 +310,7 @@ async def turn_events(text: str):
                 msgs.append(entry)
                 completed = True
                 trim(msgs)
+                spawn(finish_turn(text, entry["content"], shown))
                 yield {"t": "done"}
                 return
             yield {"t": "error", "v": "I got stuck on that one."}
@@ -570,3 +572,202 @@ def build_web_system(just_did=None) -> str:
               + "; ".join(just_did)
               + ". React to it in character, but never argue as if it had not happened.")
     return s
+
+
+# ---------------- memory ----------------
+import sqlite3  # noqa: E402
+import numpy as np  # noqa: E402
+
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3:567m")
+MIN_SIM = float(os.environ.get("MEM_MIN_SIM", "0.45"))
+DUP_SIM = 0.88
+
+
+def mdb():
+    con = sqlite3.connect(str(HERE / "companion.db"))
+    con.execute("CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, text TEXT NOT NULL, "
+                "day TEXT, emb BLOB, active INTEGER DEFAULT 1)")
+    con.execute("CREATE TABLE IF NOT EXISTS turns (id INTEGER PRIMARY KEY, role TEXT, content TEXT)")
+    return con
+
+
+async def embed(texts):
+    r = await brain.client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [d.embedding for d in r.data]
+
+
+def unit(vec) -> np.ndarray:
+    v = np.asarray(vec, dtype=np.float32)
+    n = float(np.linalg.norm(v))
+    return v / n if n else v
+
+
+def load_turns(n=12):
+    try:
+        con = mdb()
+        rows = con.execute("SELECT role, content FROM turns ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+        con.close()
+    except Exception:
+        return []
+    msgs = [{"role": r, "content": c} for r, c in reversed(rows)]
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    return msgs
+
+
+def save_turns(user_text, tagged_reply):
+    con = mdb()
+    con.execute("INSERT INTO turns(role, content) VALUES ('user', ?)", (user_text,))
+    con.execute("INSERT INTO turns(role, content) VALUES ('assistant', ?)", (tagged_reply,))
+    con.execute("DELETE FROM turns WHERE id NOT IN (SELECT id FROM turns ORDER BY id DESC LIMIT 200)")
+    con.commit()
+    con.close()
+
+
+def clear_turns():
+    con = mdb()
+    con.execute("DELETE FROM turns")
+    con.commit()
+    con.close()
+
+
+async def recall(text, k=5):
+    """Memories relevant to this message, as (id, text, day) tuples."""
+    try:
+        q = unit((await embed([text]))[0])
+
+        def search():
+            con = mdb()
+            rows = con.execute("SELECT id, text, day, emb FROM memories "
+                               "WHERE active=1 AND emb IS NOT NULL").fetchall()
+            recent = con.execute("SELECT id, text, day FROM memories WHERE active=1 "
+                                 "ORDER BY id DESC LIMIT 2").fetchall()
+            con.close()
+            scored = sorted(((float(q @ np.frombuffer(b, dtype=np.float32)), i, t, d)
+                             for i, t, d, b in rows), reverse=True)
+            for sc, i, t, d in scored[:3]:
+                print(f"[recall] {sc:.2f} {'(used)' if sc >= MIN_SIM else '(skipped)'} {t}", flush=True)
+            hits = [(i, t, d) for sc, i, t, d in scored[:k] if sc >= MIN_SIM]
+            return hits or recent   # no relevant hit (e.g. just "hey"): fall back to the latest two
+
+        return await asyncio.to_thread(search)
+    except Exception as e:
+        print(f"[recall error] {e}", flush=True)
+        return []
+
+
+MEMORY_TOOL = _tool("remember", "Save one durable fact about the user worth remembering long-term.",
+                    {"text": _STR}, ["text"])
+
+
+async def extract_memories(user_text, reply):
+    try:
+        system = (
+            f"Today is {date.today().strftime('%A')} {date.today().isoformat()}; coming days: {week_table()}.\n"
+            "You maintain a long-term memory about the user. Read the user's message (and the companion's reply, "
+            "for context only). Call remember once per distinct fact the USER revealed that is worth keeping "
+            "long-term: facts about their life, the people in it, events and plans with dates, preferences, "
+            "things they struggle with, how they feel about an ongoing situation, and how they want to be treated. "
+            "Write each as a short third-person sentence with absolute dates (for example: Has a database exam on "
+            "2026-11-20).\n"
+            "Do NOT save: greetings or small talk; passing moods that will not matter later; anything only the "
+            "companion said; goals, to-dos and habit logs (handled elsewhere); passwords, card or ID numbers; "
+            "anything the user asks not to keep. If nothing qualifies, call nothing. Never invent details.")
+        r = await brain.client.chat.completions.create(
+            model=brain.MODEL, temperature=0.2, tools=[MEMORY_TOOL],
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": f"User said: {user_text}\nCompanion replied: {reply}"}],
+            extra_body={"reasoning_effort": "none"})
+        facts = []
+        for tc in (r.choices[0].message.tool_calls or []):
+            if tc.function.name == "remember":
+                f = str(json.loads(tc.function.arguments or "{}").get("text", "")).strip()
+                if f:
+                    facts.append(f)
+        if not facts:
+            return
+        vecs = [unit(v) for v in await embed(facts)]
+
+        def save():
+            con = mdb()
+            existing = [np.frombuffer(b, dtype=np.float32) for (b,) in con.execute(
+                "SELECT emb FROM memories WHERE active=1 AND emb IS NOT NULL")]
+            for f, v in zip(facts, vecs):
+                if any(float(v @ e) >= DUP_SIM for e in existing):
+                    print(f"[memory] duplicate, skipped: {f}", flush=True)
+                    continue
+                con.execute("INSERT INTO memories(text, day, emb) VALUES (?,?,?)",
+                            (f, date.today().isoformat(), v.tobytes()))
+                existing.append(v)
+                print(f"[memory] saved: {f}", flush=True)
+            con.commit()
+            con.close()
+
+        await asyncio.to_thread(save)
+    except Exception as e:
+        print(f"[memory error] {e}", flush=True)
+
+
+async def finish_turn(user_text, tagged_reply, shown):
+    try:
+        await asyncio.to_thread(save_turns, user_text, tagged_reply)
+    except Exception as e:
+        print(f"[turns error] {e}", flush=True)
+    await extract_memories(user_text, shown)
+
+
+_prev_build2 = build_web_system
+
+
+def build_web_system(just_did=None, recalled=None) -> str:
+    s = _prev_build2(just_did)
+    if recalled:
+        lines = "\n".join(f"- {('(' + d + ') ') if d else ''}{t}" for _, t, d in recalled)
+        s += ("\n\nThings you remember about them from earlier conversations (dates show when you learned "
+              "each). Use them naturally and only when relevant: don't recite them or announce that you "
+              "remember. They are background facts, NOT promises or commitments. Never claim to remember "
+              "anything that is not listed here; if they ask what you remember and it isn't here, say you "
+              "don't.\n" + lines)
+    return s
+
+
+class MemIn(BaseModel):
+    text: str
+
+
+@app.get("/api/memories")
+async def list_memories():
+    def q():
+        con = mdb()
+        rows = con.execute("SELECT id, text, day FROM memories WHERE active=1 ORDER BY id DESC").fetchall()
+        con.close()
+        return rows
+    return {"memories": [{"id": i, "text": t, "day": d} for i, t, d in await asyncio.to_thread(q)]}
+
+
+@app.post("/api/memories")
+async def add_memory(body: MemIn):
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "empty")
+    vec = unit((await embed([text]))[0])
+
+    def save():
+        con = mdb()
+        con.execute("INSERT INTO memories(text, day, emb) VALUES (?,?,?)",
+                    (text, date.today().isoformat(), vec.tobytes()))
+        con.commit()
+        con.close()
+    await asyncio.to_thread(save)
+    return {"ok": True}
+
+
+@app.delete("/api/memories/{mem_id}")
+async def delete_memory(mem_id: int):
+    def rm():
+        con = mdb()
+        con.execute("DELETE FROM memories WHERE id=?", (mem_id,))   # permanent on purpose
+        con.commit()
+        con.close()
+    await asyncio.to_thread(rm)
+    return {"ok": True}

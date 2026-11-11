@@ -25,6 +25,14 @@
   form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--bell); }
   input[type=text] { flex: 1; padding: 11px 14px; font-size: 16px; border-radius: 12px; border: 1px solid var(--bell); background: var(--bg); color: var(--text); }
   form button { padding: 0 18px; font-size: 16px; border: 0; border-radius: 12px; background: var(--me); color: #fff; cursor: pointer; }
+  #memPanel { position: fixed; inset: 56px 16px 70px 16px; z-index: 5; display: flex; flex-direction: column; gap: 8px; padding: 14px; background: var(--bg); border: 1px solid var(--bell); border-radius: 14px; }
+  #memPanel[hidden] { display: none; }
+  #memList { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .memrow { display: flex; gap: 10px; align-items: flex-start; padding: 6px 8px; border-radius: 8px; background: var(--bell); font-size: 14px; }
+  .memrow span { flex: 1; overflow-wrap: anywhere; }
+  .memrow button { font-size: 12px; cursor: pointer; border: 1px solid var(--muted); border-radius: 6px; background: none; color: inherit; }
+  #memAdd { display: flex; gap: 8px; padding: 0; border: 0; }
+  #memAdd input { flex: 1; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--bell); background: var(--bg); color: var(--text); }
 </style>
 </head>
 <body>
@@ -32,8 +40,14 @@
   <span class="title">Bell</span>
   <span id="status"></span>
   <label><input type="checkbox" id="mute"> mute</label>
+  <button id="memBtn" type="button">memories</button>
   <button id="reset" type="button">new chat</button>
 </header>
+<div id="memPanel" hidden>
+  <strong>What Bell remembers</strong>
+  <div id="memList"></div>
+  <form id="memAdd"><input id="memInput" type="text" autocomplete="off" placeholder="Add something for her to remember"><button type="submit">Add</button></form>
+</div>
 <main id="log"></main>
 <form id="form">
   <input type="text" id="input" autocomplete="off" placeholder="Say something..." autofocus>
@@ -260,6 +274,41 @@
     try { await post('/api/reset', {}); log.innerHTML = ''; active = []; }
     catch (err) { add('error', err.message); }
   });
+
+  (function () {
+    var panel = document.getElementById('memPanel');
+    var list = document.getElementById('memList');
+    async function load() {
+      var d = await (await fetch('/api/memories')).json();
+      list.innerHTML = '';
+      if (!d.memories.length) { list.textContent = 'Nothing yet.'; return; }
+      d.memories.forEach(function (m) {
+        var row = document.createElement('div');
+        row.className = 'memrow';
+        var t = document.createElement('span');
+        t.textContent = (m.day ? m.day + ' - ' : '') + m.text;
+        var x = document.createElement('button');
+        x.textContent = 'delete';
+        x.onclick = async function () { await fetch('/api/memories/' + m.id, { method: 'DELETE' }); load(); };
+        row.appendChild(t);
+        row.appendChild(x);
+        list.appendChild(row);
+      });
+    }
+    document.getElementById('memBtn').onclick = function () {
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) load();
+    };
+    document.getElementById('memAdd').onsubmit = async function (ev) {
+      ev.preventDefault();
+      var inp = document.getElementById('memInput');
+      var v = inp.value.trim();
+      if (!v) return;
+      inp.value = '';
+      await fetch('/api/memories', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: v }) });
+      load();
+    };
+  })();
 </script>
 </body>
 </html>
